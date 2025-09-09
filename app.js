@@ -128,19 +128,34 @@ function ymd(d){
 // Role guard
 function redirectByRole(uid, pathIfAdmin, pathIfKaryawan) {
   if (ADMIN_UIDS.has(uid)) {
-    if (!location.pathname.endsWith(pathIfAdmin)) location.href = pathIfAdmin;
+    if (!location.pathname.endsWith(pathIfAdmin)) {
+      console.log("Redirecting admin to:", pathIfAdmin);
+      location.href = pathIfAdmin;
+    }
   } else if (KARYAWAN_UIDS.has(uid)) {
-    if (!location.pathname.endsWith(pathIfKaryawan)) location.href = pathIfKaryawan;
+    if (!location.pathname.endsWith(pathIfKaryawan)) {
+      console.log("Redirecting karyawan to:", pathIfKaryawan);
+      location.href = pathIfKaryawan;
+    }
   } else {
     auth.signOut();
     toast("Akses ditolak: akun belum diberi peran yang benar.");
   }
 }
+
 function guardPage(uid, required) {
   const isAdmin = ADMIN_UIDS.has(uid);
   const isKaryawan = KARYAWAN_UIDS.has(uid);
-  if (required === "admin" && !isAdmin) { location.href = "index.html"; return false; }
-  if (required === "karyawan" && !isKaryawan) { location.href = "index.html"; return false; }
+  if (required === "admin" && !isAdmin) { 
+    console.log("Access denied for admin page");
+    location.href = "index.html"; 
+    return false; 
+  }
+  if (required === "karyawan" && !isKaryawan) { 
+    console.log("Access denied for karyawan page");
+    location.href = "index.html"; 
+    return false; 
+  }
   return true;
 }
 
@@ -166,10 +181,13 @@ async function bootstrapCollections(user) {
 
 // Auth routing untuk semua halaman
 auth.onAuthStateChanged(async (user) => {
+  console.log("Auth state changed:", user ? user.uid : "No user");
   const path = location.pathname.toLowerCase();
+  
   if (!user) {
     // Cegah akses langsung
     if (path.endsWith("karyawan.html") || path.endsWith("admin.html")) {
+      console.log("Redirecting to login page");
       location.href = "index.html";
     }
     // halaman login tidak butuh apa-apa
@@ -179,6 +197,7 @@ auth.onAuthStateChanged(async (user) => {
     return;
   }
 
+  console.log("User logged in:", user.uid);
   await bootstrapCollections(user);
 
   // Update server time live
@@ -187,6 +206,7 @@ auth.onAuthStateChanged(async (user) => {
   // Routing per halaman
   if (path.endsWith("index.html") || path.endsWith("/")) {
     // Setelah login, arahkan sesuai role
+    console.log("Redirecting by role");
     redirectByRole(user.uid, "admin.html", "karyawan.html");
     return;
   }
@@ -208,15 +228,37 @@ auth.onAuthStateChanged(async (user) => {
 function bindLoginPage() {
   const loginBtn = $("#loginBtn");
   if (!loginBtn) return;
+  
   loginBtn.onclick = async () => {
     const email = $("#email").value.trim();
     const pass = $("#password").value.trim();
-    if (!email || !pass) { toast("Isi email dan kata sandi."); return; }
+    
+    if (!email || !pass) { 
+      toast("Isi email dan kata sandi."); 
+      return; 
+    }
+    
     try {
+      // Tampilkan loading
+      loginBtn.disabled = true;
+      const originalText = loginBtn.innerHTML;
+      loginBtn.innerHTML = '<span class="spinner"></span> Memeriksa...';
+      
       await auth.signInWithEmailAndPassword(email, pass);
       // onAuthStateChanged akan redirect by role
+      
+      // Tampilkan pesan sukses
+      toast("Login berhasil! Mengarahkan...");
     } catch (e) {
-      toast("Gagal masuk. Periksa kembali kredensial.");
+      console.error("Login error:", e);
+      loginBtn.disabled = false;
+      loginBtn.innerHTML = originalText;
+      
+      if (e.code === 'auth/invalid-credential' || e.code === 'auth/wrong-password' || e.code === 'auth/user-not-found') {
+        toast("Email atau kata sandi salah.");
+      } else {
+        toast("Gagal masuk. Periksa koneksi internet Anda.");
+      }
     }
   };
 }
@@ -467,7 +509,275 @@ async function deleteNotif(notifId) {
 
 // Halaman Karyawan bindings
 async function bindKaryawanPage(user) {
-  // ... (kode untuk halaman karyawan tetap sama seperti sebelumnya)
+  const video = $("#cam");
+  const canvas = $("#canvas");
+  const preview = $("#preview");
+  const jenisSel = $("#jenis");
+  const statusText = $("#statusText");
+  const statusChip = $("#statusChip");
+  const locText = $("#locText");
+
+  // Guard kamera
+  let stream;
+  try {
+    stream = await startCamera(video);
+  } catch (e) {
+    console.error("Camera error:", e);
+    toast("Tidak dapat mengakses kamera. Pastikan izin kamera diberikan.");
+  }
+
+  // Lokasi
+  let coords = null;
+  try {
+    coords = await getLocation();
+    locText.textContent = `${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}`;
+  } catch {
+    locText.textContent = "Lokasi tidak aktif";
+  }
+
+  // Profil muat
+  const profile = await getProfile(user.uid);
+  if (profile.pfp) $("#pfp").src = profile.pfp;
+  if (profile.nama) $("#nama").value = profile.nama;
+  if (profile.alamat) $("#alamat").value = profile.alamat;
+
+  // Status window
+  async function refreshStatus() {
+    const serverNow = await getServerTime();
+    const today = ymd(serverNow);
+    const override = await getScheduleOverride(today);
+    const isSunday = serverNow.getDay() === 0;
+    const jenis = jenisSel.value;
+
+    let wajib = true;
+    if (override === "forceOn") wajib = true;
+    else if (override === "forceOff") wajib = false;
+    else wajib = !isSunday;
+
+    if (!wajib) {
+      statusText.textContent = "Hari ini tidak wajib presensi";
+      statusChip.className = "status s-warn";
+      return { allowed: false, reason:"not-required" };
+    }
+
+    const win = inWindow(serverNow, jenis, 30);
+    if (!win.allowed) {
+      statusText.textContent = "Di luar jam presensi";
+      statusChip.className = "status s-bad";
+      return { allowed:false, reason:"out-of-window" };
+    } else {
+      statusText.textContent = win.status === "tepat" ? "Tepat waktu" : "Terlambat";
+      statusChip.className = "status " + (win.status === "tepat" ? "s-good" : "s-warn");
+      return { allowed:true, status:win.status, serverNow };
+    }
+  }
+  let lastStatus = await refreshStatus();
+  setInterval(async () => { lastStatus = await refreshStatus(); }, 30_000);
+
+  // Snap
+  $("#snapBtn").onclick = () => {
+    captureToCanvas(video, canvas);
+    canvas.style.display = "block";
+    preview.style.display = "none";
+    toast("Foto diambil. Anda bisa langsung upload.");
+  };
+
+  // Upload
+  $("#uploadBtn").onclick = async () => {
+    // Periksa status window lagi
+    lastStatus = await refreshStatus();
+    if (!lastStatus.allowed) {
+      toast("Presensi ditolak: di luar jadwal atau tidak wajib.");
+      return;
+    }
+    if (!coords) {
+      toast("Lokasi belum aktif.");
+      return;
+    }
+    // Pastikan ada gambar di canvas
+    if (canvas.width === 0 || canvas.height === 0) {
+      toast("Ambil selfie dulu.");
+      return;
+    }
+    try {
+      // Tampilkan loading
+      const originalText = $("#uploadBtn").innerHTML;
+      $("#uploadBtn").innerHTML = '<span class="spinner"></span> Mengupload...';
+      $("#uploadBtn").disabled = true;
+      
+      const blob = await canvasToCompressedBlob(canvas, 30);
+      const url = await uploadToCloudinary(blob);
+      preview.src = url;
+      preview.style.display = "block";
+      // Simpan presensi
+      const nama = ($("#nama")?.value || profile.nama || user.email.split("@")[0]).trim();
+      const jenis = jenisSel.value;
+      const status = lastStatus.status === "tepat" ? "tepat" : "terlambat";
+      await savePresensi({
+        uid: user.uid,
+        nama,
+        jenis,
+        status,
+        lat: coords.lat,
+        lng: coords.lng,
+        selfieUrl: url,
+        serverDate: lastStatus.serverNow
+      });
+      toast("Presensi tersimpan.");
+      notify(`Presensi ${jenis} tercatat (${status}).`);
+    } catch (e) {
+      console.error("Upload error:", e);
+      toast("Gagal menyimpan presensi.");
+    } finally {
+      // Kembalikan tombol ke keadaan semula
+      $("#uploadBtn").innerHTML = originalText;
+      $("#uploadBtn").disabled = false;
+    }
+  };
+
+  // Riwayat singkat
+  const unsubLog = subscribeRiwayat(user.uid, (items) => {
+    const list = $("#logList");
+    list.innerHTML = "";
+    items.forEach(it => {
+      const badge = it.status === "tepat" ? "s-good" : (it.status==="terlambat"?"s-warn":"s-bad");
+      const el = document.createElement("div");
+      el.className = "row";
+      el.style.justifyContent = "space-between";
+      el.innerHTML = `
+        <div class="row" style="gap:8px">
+          <span class="material-symbols-rounded">schedule</span>
+          <b>${it.localTime}</b>
+          <span>•</span>
+          <span>${it.jenis}</span>
+        </div>
+        <span class="status ${badge}">${it.status}</span>
+      `;
+      list.appendChild(el);
+    });
+  });
+
+  // Notifikasi dialog
+  $("#notifBtn").onclick = () => $("#notifDlg").showModal();
+  const unsubNotif = subscribeNotifForKaryawan(user.uid, (items) => {
+    const list = $("#notifList");
+    list.innerHTML = "";
+    items.forEach(it => {
+      const el = document.createElement("div");
+      el.className = "notif-item";
+      const sub = it.type === "announce" ? "Pengumuman" : "Info";
+      el.innerHTML = `
+        <div class="notif-content">
+          <div style="font-weight:700">${sub}</div>
+          <div style="opacity:.8; margin-top:4px">${it.text || "(tanpa teks)"}</div>
+        </div>
+        <div class="notif-actions">
+          <button class="icon-btn delete-notif" data-id="${it.id}" title="Hapus notifikasi">
+            <span class="material-symbols-rounded">close</span>
+          </button>
+        </div>
+      `;
+      list.appendChild(el);
+    });
+    
+    // Bind delete actions
+    $$(".delete-notif").forEach(btn => {
+      btn.onclick = async () => {
+        const notifId = btn.dataset.id;
+        await deleteNotif(notifId);
+        toast("Notifikasi dihapus");
+      };
+    });
+  });
+
+  // Cuti FAB
+  $("#cutiFab").onclick = () => $("#cutiDlg").showModal();
+  $("#ajukanCutiBtn").onclick = async () => {
+    const jenis = $("#cutiJenis").value;
+    const tanggal = $("#cutiTanggal").value;
+    const catatan = $("#cutiCatatan").value.trim();
+    if (!tanggal) { toast("Pilih tanggal cuti."); return; }
+    
+    try {
+      // Tampilkan loading
+      const originalText = $("#ajukanCutiBtn").innerHTML;
+      $("#ajukanCutiBtn").innerHTML = '<span class="spinner"></span> Mengajukan...';
+      $("#ajukanCutiBtn").disabled = true;
+      
+      const nama = ($("#nama")?.value || profile.nama || user.email.split("@")[0]).trim();
+      await ajukanCuti(user.uid, nama, jenis, tanggal, catatan);
+      toast("Permintaan cuti dikirim.");
+      notify("Permintaan cuti terkirim.");
+      $("#cutiDlg").close();
+    } catch (e) {
+      console.error("Cuti error:", e);
+      toast("Gagal mengajukan cuti.");
+    } finally {
+      // Kembalikan tombol ke keadaan semula
+      $("#ajukanCutiBtn").innerHTML = originalText;
+      $("#ajukanCutiBtn").disabled = false;
+    }
+  };
+
+  // Profil dialog
+  $("#profileBtn").onclick = () => $("#profileDlg").showModal();
+  $("#saveProfileBtn").onclick = async () => {
+    try {
+      // Tampilkan loading
+      const originalText = $("#saveProfileBtn").innerHTML;
+      $("#saveProfileBtn").innerHTML = '<span class="spinner"></span> Menyimpan...';
+      $("#saveProfileBtn").disabled = true;
+      
+      let pfpUrl;
+      const file = $("#pfpFile").files?.[0];
+      if (file) {
+        // kompres
+        const img = await file.arrayBuffer();
+        const blob = new Blob([img]);
+        // Untuk kompres file, gunakan canvas perantara
+        const imgEl = document.createElement("img");
+        imgEl.src = URL.createObjectURL(file);
+        await new Promise(r => imgEl.onload = r);
+        const c = document.createElement("canvas");
+        const scale = Math.min(1, 512 / Math.max(imgEl.width, imgEl.height));
+        c.width = Math.max(64, Math.round(imgEl.width * scale));
+        c.height = Math.max(64, Math.round(imgEl.height * scale));
+        const ctx = c.getContext("2d");
+        ctx.drawImage(imgEl, 0, 0, c.width, c.height);
+        const pfpBlob = await new Promise(r => c.toBlob(r, "image/jpeg", 0.7));
+        pfpUrl = await uploadToCloudinary(pfpBlob);
+        $("#pfp").src = pfpUrl;
+      }
+      const nama = $("#nama").value.trim();
+      const alamat = $("#alamat").value.trim();
+      await saveProfile(user.uid, { nama, alamat, pfpUrl });
+      toast("Profil tersimpan.");
+      notify("Profil berhasil diperbarui.");
+    } catch (e) {
+      console.error("Profile error:", e);
+      toast("Gagal menyimpan profil.");
+    } finally {
+      // Kembalikan tombol ke keadaan semula
+      $("#saveProfileBtn").innerHTML = originalText;
+      $("#saveProfileBtn").disabled = false;
+    }
+  };
+  $("#logoutBtn").onclick = async () => { 
+    try {
+      await auth.signOut(); 
+      location.href = "index.html"; 
+    } catch (e) {
+      console.error("Logout error:", e);
+      toast("Gagal logout.");
+    }
+  };
+
+  // Bersihkan stream saat keluar
+  window.addEventListener("beforeunload", () => {
+    try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
+    unsubLog && unsubLog();
+    unsubNotif && unsubNotif();
+  });
 }
 
 // Halaman Admin bindings
@@ -493,11 +803,24 @@ async function bindAdminPage(user) {
 
   // Dialogs
   $("#profileBtn").onclick = () => $("#profileDlg").showModal();
-  $("#logoutBtn").onclick = async () => { await auth.signOut(); location.href="index.html"; };
+  $("#logoutBtn").onclick = async () => { 
+    try {
+      await auth.signOut(); 
+      location.href="index.html"; 
+    } catch (e) {
+      console.error("Logout error:", e);
+      toast("Gagal logout.");
+    }
+  };
 
   // Simpan profil
   $("#saveProfileBtn").onclick = async () => {
     try {
+      // Tampilkan loading
+      const originalText = $("#saveProfileBtn").innerHTML;
+      $("#saveProfileBtn").innerHTML = '<span class="spinner"></span> Menyimpan...';
+      $("#saveProfileBtn").disabled = true;
+      
       let pfpUrl;
       const file = $("#pfpFile").files?.[0];
       if (file) {
@@ -519,8 +842,13 @@ async function bindAdminPage(user) {
       await saveProfile(user.uid, { nama, alamat, pfpUrl });
       toast("Profil admin tersimpan.");
       notify("Profil admin diperbarui.");
-    } catch {
+    } catch (e) {
+      console.error("Profile error:", e);
       toast("Gagal menyimpan profil admin.");
+    } finally {
+      // Kembalikan tombol ke keadaan semula
+      $("#saveProfileBtn").innerHTML = originalText;
+      $("#saveProfileBtn").disabled = false;
     }
   };
 
@@ -554,14 +882,42 @@ async function bindAdminPage(user) {
     });
     // Bind actions
     $$("[data-act='approve']").forEach(b => b.onclick = async () => {
-      await setCutiStatus(b.dataset.id, "disetujui", user.uid, profile.nama || "Admin");
-      toast("Cuti disetujui.");
-      notify("Ada cuti disetujui.");
+      try {
+        // Tampilkan loading
+        const originalText = b.innerHTML;
+        b.innerHTML = '<span class="spinner"></span>';
+        b.disabled = true;
+        
+        await setCutiStatus(b.dataset.id, "disetujui", user.uid, profile.nama || "Admin");
+        toast("Cuti disetujui.");
+        notify("Ada cuti disetujui.");
+      } catch (e) {
+        console.error("Approve error:", e);
+        toast("Gagal menyetujui cuti.");
+      } finally {
+        // Kembalikan tombol ke keadaan semula
+        b.innerHTML = originalText;
+        b.disabled = false;
+      }
     });
     $$("[data-act='reject']").forEach(b => b.onclick = async () => {
-      await setCutiStatus(b.dataset.id, "ditolak", user.uid, profile.nama || "Admin");
-      toast("Cuti ditolak.");
-      notify("Ada cuti ditolak.");
+      try {
+        // Tampilkan loading
+        const originalText = b.innerHTML;
+        b.innerHTML = '<span class="spinner"></span>';
+        b.disabled = true;
+        
+        await setCutiStatus(b.dataset.id, "ditolak", user.uid, profile.nama || "Admin");
+        toast("Cuti ditolak.");
+        notify("Ada cuti ditolak.");
+      } catch (e) {
+        console.error("Reject error:", e);
+        toast("Gagal menolak cuti.");
+      } finally {
+        // Kembalikan tombol ke keadaan semula
+        b.innerHTML = originalText;
+        b.disabled = false;
+      }
     });
   });
 
@@ -569,39 +925,77 @@ async function bindAdminPage(user) {
   $("#announceFab").onclick = async () => {
     const text = prompt("Tulis pengumuman:");
     if (!text) return;
-    await kirimPengumuman(text, user.uid, profile.nama || "Admin");
-    toast("Pengumuman terkirim.");
+    try {
+      await kirimPengumuman(text, user.uid, profile.nama || "Admin");
+      toast("Pengumuman terkirim.");
+    } catch (e) {
+      console.error("Announce error:", e);
+      toast("Gagal mengirim pengumuman.");
+    }
   };
   $("#sendAnnounce").onclick = async () => {
     const text = $("#announceText").value.trim();
     if (!text) { toast("Tulis isi pengumuman."); return; }
-    await kirimPengumuman(text, user.uid, profile.nama || "Admin");
-    $("#announceText").value = "";
-    toast("Pengumuman terkirim.");
+    try {
+      // Tampilkan loading
+      const originalText = $("#sendAnnounce").innerHTML;
+      $("#sendAnnounce").innerHTML = '<span class="spinner"></span> Mengirim...';
+      $("#sendAnnounce").disabled = true;
+      
+      await kirimPengumuman(text, user.uid, profile.nama || "Admin");
+      $("#announceText").value = "";
+      toast("Pengumuman terkirim.");
+    } catch (e) {
+      console.error("Announce error:", e);
+      toast("Gagal mengirim pengumuman.");
+    } finally {
+      // Kembalikan tombol ke keadaan semula
+      $("#sendAnnounce").innerHTML = originalText;
+      $("#sendAnnounce").disabled = false;
+    }
   };
 
   // Jadwal wajib / tidak
   $("#saveSchedule").onclick = async () => {
     const mode = $("#wajibHari").value;
     const now = await getServerTime();
-    await setHariMode(mode, ymd(now), user.uid, profile.nama || "Admin");
-    toast("Pengaturan hari tersimpan.");
+    try {
+      // Tampilkan loading
+      const originalText = $("#saveSchedule").innerHTML;
+      $("#saveSchedule").innerHTML = '<span class="spinner"></span> Menyimpan...';
+      $("#saveSchedule").disabled = true;
+      
+      await setHariMode(mode, ymd(now), user.uid, profile.nama || "Admin");
+      toast("Pengaturan hari tersimpan.");
+    } catch (e) {
+      console.error("Schedule error:", e);
+      toast("Gagal menyimpan pengaturan.");
+    } finally {
+      // Kembalikan tombol ke keadaan semula
+      $("#saveSchedule").innerHTML = originalText;
+      $("#saveSchedule").disabled = false;
+    }
   };
 
   // Tabel presensi + filter + export CSV
   let lastData = [];
   async function loadPresensi() {
-    let q = db.collection("presensi").orderBy("createdAt", "desc").limit(500);
-    const nama = $("#fNama").value.trim().toLowerCase();
-    const tanggal = $("#fTanggal").value;
-    const snap = await q.get();
-    const arr = [];
-    snap.forEach(d => arr.push({ id:d.id, ...d.data() }));
-    let filtered = arr;
-    if (tanggal) filtered = filtered.filter(x => x.ymd === tanggal);
-    if (nama) filtered = filtered.filter(x => (x.nama||"").toLowerCase().includes(nama));
-    lastData = filtered;
-    renderTable(filtered);
+    try {
+      let q = db.collection("presensi").orderBy("createdAt", "desc").limit(500);
+      const nama = $("#fNama").value.trim().toLowerCase();
+      const tanggal = $("#fTanggal").value;
+      const snap = await q.get();
+      const arr = [];
+      snap.forEach(d => arr.push({ id:d.id, ...d.data() }));
+      let filtered = arr;
+      if (tanggal) filtered = filtered.filter(x => x.ymd === tanggal);
+      if (nama) filtered = filtered.filter(x => (x.nama||"").toLowerCase().includes(nama));
+      lastData = filtered;
+      renderTable(filtered);
+    } catch (e) {
+      console.error("Load presensi error:", e);
+      toast("Gagal memuat data presensi.");
+    }
   }
   function renderTable(rows) {
     const tb = $("#tableBody");
@@ -623,9 +1017,15 @@ async function bindAdminPage(user) {
   $("#applyFilter").onclick = () => loadPresensi();
   $("#exportCsv").onclick = () => {
     if (!lastData.length) { toast("Tidak ada data untuk diekspor."); return; }
-    const cols = ["localTime","nama","jenis","status","lat","lng","selfieUrl","uid","ymd"];
-    const csv = toCSV(lastData, cols);
-    download(`presensi_${Date.now()}.csv`, csv);
+    try {
+      const cols = ["localTime","nama","jenis","status","lat","lng","selfieUrl","uid","ymd"];
+      const csv = toCSV(lastData, cols);
+      download(`presensi_${Date.now()}.csv`, csv);
+      toast("Data berhasil diekspor.");
+    } catch (e) {
+      console.error("Export error:", e);
+      toast("Gagal mengekspor data.");
+    }
   };
   // Muat awal + refresh periodik ringan
   await loadPresensi();
@@ -640,16 +1040,31 @@ async function bindAdminPage(user) {
     const pass = $("#newPass").value.trim();
     if (!email || !pass) { toast("Isi email dan kata sandi."); return; }
     try {
+      // Tampilkan loading
+      const originalText = $("#createUserBtn").innerHTML;
+      $("#createUserBtn").innerHTML = '<span class="spinner"></span> Membuat...';
+      $("#createUserBtn").disabled = true;
+      
       const cred = await secondAuth.createUserWithEmailAndPassword(email, pass);
       const uid = cred.user.uid;
       await db.collection("users").doc(uid).set({
         email, role:"karyawan", createdBy: user.uid, createdAt: firebase.firestore.FieldValue.serverTimestamp()
       }, { merge:true });
+      // Kembalikan secondAuth ke kosong signOut agar tidak mengganggu
       await secondAuth.signOut();
       toast("Akun karyawan dibuat.");
       notify("Akun karyawan baru telah dibuat.");
+      
+      // Reset form
+      $("#newEmail").value = "";
+      $("#newPass").value = "";
     } catch (e) {
+      console.error("Create user error:", e);
       toast("Gagal membuat akun karyawan.");
+    } finally {
+      // Kembalikan tombol ke keadaan semula
+      $("#createUserBtn").innerHTML = originalText;
+      $("#createUserBtn").disabled = false;
     }
   };
 
@@ -658,3 +1073,21 @@ async function bindAdminPage(user) {
     unsubCuti && unsubCuti();
   });
 }
+
+// Tambahkan style untuk spinner
+const style = document.createElement('style');
+style.textContent = `
+  .spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid rgba(255,255,255,0.3);
+    border-radius: 50%;
+    border-top-color: #fff;
+    animation: spin 1s ease-in-out infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+`;
+document.head.appendChild(style);
